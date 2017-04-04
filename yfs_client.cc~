@@ -1,0 +1,882 @@
+
+// yfs client.  implements FS operations using extent and lock server
+#include "yfs_client.h"
+#include "extent_client.h"
+#include <sstream>
+#include <iostream>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include "tprintf.h"
+#define DBG_ISXX1
+#define DBG_CREATE1
+#define DBG_READDIR1
+#define DBG_UNLINK1
+#define DBG_MKDIR1
+#define DBG_WRITE1
+#define DBG_SYMLINK1
+#define DBG_LOOKUP1
+
+
+yfs_client::yfs_client(std::string extent_dst, std::string lock_dst)
+{
+	ec = new extent_client(extent_dst);
+	lr = new lock_release(ec);
+  	lc = new lock_client_cache(lock_dst, lr);
+  	lc->acquire(1);
+	if (ec->put(1, "") != extent_protocol::OK)
+		printf("error init root dir\n"); // XYB: init root dir
+	lc->release(1);
+}
+
+lock_release::lock_release(extent_client* ec){
+    this->ec = ec;
+}
+
+void lock_release::dorelease(lock_protocol::lockid_t lid)
+{
+    //tprintf("dorelease lid=%llu\n", lid);
+    ec->flush(lid);
+    //tprintf("dorelease done lid=%llu\n", lid);
+}
+
+void lock_release::doacquire(lock_protocol::lockid_t lid)
+{
+    //tprintf("doacquire lid=%llu\n", lid);
+    ec->loadInfo(lid);
+    //tprintf("doacquire done lid=%llu\n", lid);
+}
+
+void yfs_client::removeSpace(std::string &str)
+{
+	size_t pos = str.find(' ',0);
+	while(pos != std::string::npos)
+	{
+		str.replace(pos, 1,1, '~');
+		pos = str.find(' ', pos+1);
+	}
+
+	pos = str.find('\n',0);
+	while(pos != std::string::npos)
+	{
+		str.replace(pos, 1,1, '`');
+		pos = str.find('\n', pos+1);
+	}
+
+	pos = str.find('\t',0);
+	while(pos != std::string::npos)
+	{
+		str.replace(pos, 1,1, '@');
+		pos = str.find('\t', pos+1);
+	}
+	return ;
+}
+
+void yfs_client::addSpace(std::string &str)
+{
+	size_t pos = str.find('~',0);
+	while(pos != std::string::npos)
+	{
+		str.replace(pos, 1,1, ' ');
+		pos = str.find('~', pos+1);
+	}
+	pos = str.find('`',0);
+	while(pos != std::string::npos)
+	{
+		str.replace(pos, 1,1, '\n');
+		pos = str.find('`', pos+1);
+	}
+
+	pos = str.find('@',0);
+	while(pos != std::string::npos)
+	{
+		str.replace(pos, 1,1, '\t');
+		pos = str.find('@', pos+1);
+	}
+
+	return ;
+}
+
+
+
+
+yfs_client::inum
+	yfs_client::n2i(std::string n)
+{
+	std::istringstream ist(n);
+	unsigned long long finum;
+	ist >> finum;
+	return finum;
+}
+
+std::string
+	yfs_client::filename(inum inum)
+{
+	std::ostringstream ost;
+	ost << inum;
+	return ost.str();
+}
+
+bool
+	yfs_client::isfile(inum inum)
+{
+	extent_protocol::attr a;
+	lc->acquire(inum);
+#ifdef DBG_ISXX
+	printf("yfs_client::isfile(), inum=%llu\n", inum);
+#endif
+	if (ec->getattr(inum, a) != extent_protocol::OK) {
+		printf("error getting attr\n");
+		lc->release(inum);
+		return false;
+	}
+
+	if (a.type == extent_protocol::T_FILE)
+	{
+		printf("isfile: %lld is a file\n", inum);
+		lc->release(inum);
+		return true;
+	}
+	printf("isfile: %lld is not a file\n", inum);
+	lc->release(inum);
+	return false;
+}
+/** Your code here for Lab...
+* You may need to add routines such as
+* readlink, issymlink here to implement symbolic link.
+*
+* */
+
+bool
+	yfs_client::isdir(inum inum)
+{
+	extent_protocol::attr a;
+	lc->acquire(inum);
+#ifdef DBG_ISXX
+	printf("yfs_client::isdir(), inum=%llu\n", inum);
+#endif
+	if (ec->getattr(inum, a) != extent_protocol::OK) {
+		printf("error getting attr\n");
+		lc->release(inum);
+		return false;
+	}
+
+	if (a.type == extent_protocol::T_DIR)
+	{
+		printf("yfs_client::isdir(): %lld is a dir\n", inum);
+		lc->release(inum);
+		return true;
+	}
+	printf("yfs_client::isdir(): %lld is not a dir\n", inum);
+	lc->release(inum);
+	return false;
+}
+
+bool
+	yfs_client::issymbol(inum inum)
+{
+	extent_protocol::attr a;
+	lc->acquire(inum);
+#ifdef DBG_ISXX
+	printf("yfs_client::issymbol(), inum=%llu\n", inum);
+#endif
+	if (ec->getattr(inum, a) != extent_protocol::OK) {
+		printf("error getting attr\n");
+		lc->release(inum);
+		return false;
+	}
+
+	if (a.type == extent_protocol::T_SYMLINK)
+	{
+		printf("yfs_client::issymbol(): %lld is a symbolic link\n", inum);
+		lc->release(inum);
+		return true;
+	}
+	printf("yfs_client::issymbol(): %lld is not a symbolic link\n", inum);
+	lc->release(inum);
+	return false;
+}
+
+
+int
+	yfs_client::getfile(inum inum, fileinfo &fin)
+{
+	int r = OK;
+    lc->acquire(inum);
+	printf("getfile %016llx\n", inum);
+	extent_protocol::attr a;
+	if (ec->getattr(inum, a) != extent_protocol::OK) {
+		r = IOERR;
+		goto release;
+	}
+
+	fin.atime = a.atime;
+	fin.mtime = a.mtime;
+	fin.ctime = a.ctime;
+	fin.size = a.size;
+	printf("getfile %016llx -> sz %llu\n", inum, fin.size);
+
+release:
+    lc->release(inum);
+	return r;
+}
+
+int
+	yfs_client::getdir(inum inum, dirinfo &din)
+{
+	int r = OK;
+	lc->acquire(inum);
+	printf("getdir %016llx\n", inum);
+	extent_protocol::attr a;
+	if (ec->getattr(inum, a) != extent_protocol::OK) {
+		r = IOERR;
+		goto release;
+	}
+	din.atime = a.atime;
+	din.mtime = a.mtime;
+	din.ctime = a.ctime;
+
+release:
+	lc->release(inum);
+	return r;
+}
+
+
+int
+	yfs_client::getsym(inum inum, syminfo &sin)
+{
+	int r = OK;
+	lc->acquire(inum);
+	printf("getsym %016llx\n", inum);
+	extent_protocol::attr a;
+	if (ec->getattr(inum, a) != extent_protocol::OK) {
+		r = IOERR;
+		goto release;
+	}
+	sin.atime = a.atime;
+	sin.mtime = a.mtime;
+	sin.ctime = a.ctime;
+    sin.size = a.size;
+release:
+	lc->release(inum);
+	return r;
+}
+
+
+#define EXT_RPC(xx) do { \
+	if ((xx) != extent_protocol::OK) { \
+	printf("EXT_RPC Error: %s:%d \n", __FILE__, __LINE__); \
+	r = IOERR; \
+	goto release; \
+	} \
+} while (0)
+
+// Only support set size of attr
+int
+	yfs_client::setattr(inum ino, size_t size)
+{
+	int r = OK;
+    lc->acquire(ino);
+	/*
+	* your lab2 code goes here.
+	* note: get the content of inode ino, and modify its content
+	* according to the size (<, =, or >) content length.
+	*/
+	std::string content;
+	if(ec->get(ino, content) == extent_protocol::OK)
+	{
+		content.resize(size,'\0');
+		ec->put(ino, content);
+	}else
+	{
+		r = IOERR;
+		goto release;
+	}
+
+release:
+    lc->release(ino);
+	return r;
+}
+
+int
+	yfs_client::create(inum parent, const char *name, mode_t mode, inum &ino_out)
+{
+	int r = OK;
+    lc->acquire(parent);
+	/*
+	* your lab2 code goes here.
+	* note: lookup is what you need to check if file exist;
+	* after create file or dir, you must remember to modify the parent infomation.
+	*/
+	bool found = false;
+	std::string nameStr;
+	nameStr.assign(name);
+#ifdef DBG_CREATE
+	printf("[yfs_client::create()] : Checking file %s existence\n", name);
+#endif
+	if(lookup2(parent, name, found, ino_out) == IOERR)
+	{
+		printf("[yfs_client::create()] : Failed, file %s IO ERR!\n", name);
+		r = IOERR;
+		goto release;
+
+	}
+	if(found == true)
+	{
+		printf("[yfs_client::create()] : Failed, file %s already exist!\n", name);
+		r = EXIST;
+		goto release;
+	}
+	else
+	{
+#ifdef DBG_CREATE
+		printf("[yfs_client::create()] : Creating file %s\n", name);
+#endif
+		//Create node error
+		if( ec->create(extent_protocol::T_FILE, ino_out) == IOERR)
+		{
+			r = IOERR;
+			goto release;
+		}
+		//Node allocation error
+		if(ino_out == 0)
+		{
+			printf("[yfs_client::create()] : No node available!\n");
+			r = OK;
+			goto release;
+		}
+		else
+		{
+			//Update parent info
+
+			std::string buf;	//buf stores filename and nodenumber pair in the parent node
+			removeSpace(nameStr);
+			ec->get(parent, buf);
+#ifdef DBG_CREATE
+			std::cout<<"[yfs_client::create()]: BEFORE: "<<std::endl;
+			std::cout<<buf<<std::endl;
+#endif
+			buf = buf + nameStr;
+#ifdef DBG_CREATE
+			std::cout<<"[yfs_client::create()]: INSERT: "<<nameStr<<ino_out<<std::endl;
+#endif
+			std::ostringstream oss;
+			oss<< '\r' << ino_out << '\r';
+			buf = buf + oss.str();
+			ec->put(parent, buf);
+#ifdef DBG_CREATE
+			std::cout<<"[yfs_client::create()]: AFTER: "<<std::endl;
+			std::cout<<buf<<std::endl;
+#endif
+		}
+	}
+
+
+release:
+    lc->release(parent);
+	return r;
+}
+
+int
+	yfs_client::mkdir(inum parent, const char *name, mode_t mode, inum &ino_out)
+{
+	int r = OK;
+    lc->acquire(parent);
+	/*
+	* your lab2 code goes here.
+	* note: lookup is what you need to check if file exist;
+	* after create file or dir, you must remember to modify the parent infomation.
+	*/
+	bool found = false;
+	std::string nameStr;
+	nameStr.assign(name);
+#ifdef DBG_MKDIR
+	printf("[yfs_client::mkdir()] : Checking dir %s existence\n", name);
+#endif
+	if(lookup2(parent, name, found, ino_out) == IOERR)
+	{
+		printf("[yfs_client::mkdir()] : Failed, dir %s IO ERR!\n", name);
+		r = IOERR;
+		goto release;
+	}
+	if(found == true)
+	{
+		printf("[yfs_client::mkdir()] : Failed, dir %s already exist!\n", name);
+		r = EXIST;
+		goto release;
+	}
+	else
+	{
+#ifdef DBG_CREATE
+		printf("[yfs_client::mkdir()] : Creating dir %s\n", name);
+#endif
+		//Create node error
+		if( ec->create(extent_protocol::T_DIR, ino_out) == IOERR)
+		{
+			r = IOERR;
+			goto release;
+		}
+		//Node allocation error
+		if(ino_out == 0)
+		{
+			printf("[yfs_client::mkdir()] : No node available!\n");
+			r = OK;
+			goto release;
+		}
+		else
+		{
+			//Update parent info
+			std::string buf;	//buf stores filename and nodenumber pair in the parent node
+			removeSpace(nameStr);
+			ec->get(parent, buf);
+#ifdef DBG_CREATE
+			std::cout<<"[yfs_client::mkdir()]: BEFORE: "<<std::endl;
+			std::cout<<buf<<std::endl;
+#endif
+			buf = buf + nameStr;
+#ifdef DBG_CREATE
+			std::cout<<"[yfs_client::mkdir()]: INSERT: "<<nameStr<<ino_out<<std::endl;
+#endif
+			std::ostringstream oss;
+			oss<< '\r' << ino_out << '\r';
+			buf = buf + oss.str();
+			ec->put(parent, buf);
+#ifdef DBG_CREATE
+			std::cout<<"[yfs_client::mkdir()]: AFTER: "<<std::endl;
+			std::cout<<buf<<std::endl;
+#endif
+		}
+	}
+
+release:
+    lc->release(parent);
+	return r;
+}
+
+int
+	yfs_client::symlink(inum parent, const char *name, const char *target, inum &ino_out)
+{
+	int r = OK;
+    lc->acquire(parent);
+	/*
+	* your lab2 code goes here.
+	* note: lookup is what you need to check if file exist;
+	* after create file or dir, you must remember to modify the parent infomation.
+	*/
+	bool found = false;
+	std::string nameStr(name);
+	std::string targetStr(target);
+	std::string targetNameStr = targetStr;
+#ifdef DBG_SYMLINK
+	std::cout<<"targetNameStr = "<<targetNameStr<<std::endl;
+#endif
+	if(targetStr.rfind('/') != std::string::npos)
+	{
+		targetNameStr = targetStr.substr(targetStr.rfind('/') + 1);
+	}
+#ifdef DBG_SYMLINK
+	std::cout<<"targetNameStr = "<<targetNameStr<<std::endl;
+#endif
+	lookup2(parent, targetNameStr.c_str(), found, ino_out);
+	//Find overlapping part
+	if(found == true)
+	{
+		targetStr = targetNameStr;
+	}
+	found = false;
+#ifdef DBG_SYMLINK
+	std::cout<<"symlink() targetStr = "<<targetStr<<std::endl;
+#endif
+    size_t len = targetStr.length();
+#ifdef DBG_SYMLINK
+	printf("[yfs_client::symlink()] : Checking symlinkfile %s existence\n", name);
+#endif
+	if(lookup2(parent, name, found, ino_out) == IOERR)
+	{
+		printf("[yfs_client::symlink()] : Failed, symlinkfile %s IO ERR!\n", name);
+		r = IOERR;
+		goto release;
+	}
+	if(found == true)
+	{
+		printf("[yfs_client::symlink()] : Failed, symlinkfile %s already exist!\n", name);
+		r = EXIST;
+		goto release;
+	}
+	else
+	{
+#ifdef DBG_SYMLINK
+		printf("[yfs_client::symlink()] : Creating symlinkfile %s\n", name);
+#endif
+		//Create node error
+		if( ec->create(extent_protocol::T_SYMLINK, ino_out) == IOERR)
+		{
+			r = IOERR;
+			goto release;
+		}
+		//Node allocation error
+		if(ino_out == 0)
+		{
+			printf("[yfs_client::symlink()] : No node available!\n");
+			r = OK;
+			goto release;
+		}
+		else
+		{
+
+            size_t writeSize = 0;
+            lc->release(parent);
+            //Write target link to inode
+            if( yfs_client::write(ino_out, len, 0, targetStr.c_str(), writeSize) == IOERR)
+            {
+                r = IOERR;
+                goto release;
+            }
+            lc->acquire(parent);
+			//Update parent info
+			std::string buf;	//buf stores filename and nodenumber pair in the parent node
+			removeSpace(nameStr);
+			ec->get(parent, buf);
+#ifdef DBG_SYMLINK
+			std::cout<<"[yfs_client::symlink()]: BEFORE: "<<std::endl;
+			std::cout<<buf<<std::endl;
+#endif
+			buf = buf + nameStr;
+#ifdef DBG_SYMLINK
+			std::cout<<"[yfs_client::symlink()]: INSERT: "<<nameStr<<ino_out<<std::endl;
+#endif
+			std::ostringstream oss;
+			oss<< '\r' << ino_out << '\r';
+			buf = buf + oss.str();
+			ec->put(parent, buf);
+#ifdef DBG_SYMLINK
+			std::cout<<"[yfs_client::symlink()]: AFTER: "<<std::endl;
+			std::cout<<buf<<std::endl;
+#endif
+		}
+	}
+
+release:
+    lc->release(parent);
+	return r;
+}
+
+
+//Filename are splitted by '\r'
+//Format are pairs of "[fileName]\r[nodeNumber]\r"
+int
+	yfs_client::lookup(inum parent, const char *name, bool &found, inum &ino_out)
+{
+
+	int r = OK;
+	//printf("[yfs_client::lookup()] : parent %llu stat is %d\n", parent, lc->stat(parent));
+
+    lc->acquire(parent);
+
+	std::string buf;
+    std::istringstream ss;
+	std::string fileName;
+	std::string nodeStr;
+	std::string targetName(name);
+	size_t targetPos;
+
+	if(ec->get(parent, buf) != extent_protocol::OK)
+	{
+		r = IOERR;
+		goto release;
+	}
+	ss.str(buf);
+#ifdef DBG_LOOKUP
+	std::cout<<"[yfs_client::lookup()] : Buffer is\n\r"<<buf<<std::endl;
+#endif
+	removeSpace(targetName);
+	found = false;
+	targetPos = buf.find(targetName+'\r');
+
+
+	if(targetPos == std::string::npos)
+	{
+		printf("[yfs_client::lookup()] : File %s not found.\n", name);
+		r = NOENT;
+		goto release;
+	}
+	else
+	{
+
+		printf("[yfs_client::lookup()] : File %s found at pos %lu.\n", name, targetPos);
+		found = true;
+		ss.seekg(targetPos);
+		ss>>fileName>>nodeStr;
+		ino_out = n2i(nodeStr);
+		std::cout<<"fileName="<<fileName<<", nodeStr="<<nodeStr<<std::endl;
+		printf("[yfs_client::lookup()] : File %s, node %llu.\n", name, ino_out);
+	}
+
+release:
+
+
+	lc->release(parent);
+
+	return r;
+}
+
+int
+	yfs_client::lookup2(inum parent, const char *name, bool &found, inum &ino_out)
+{
+	int  r = OK;
+	//lc->acquire(parent + 10000);
+	std::string buf;
+    std::istringstream ss;
+	std::string fileName;
+	std::string nodeStr;
+	std::string targetName(name);
+	size_t targetPos;
+
+	if(ec->get(parent, buf) != extent_protocol::OK)
+	{
+		r = IOERR;
+		goto release;
+	}
+	ss.str(buf);
+#ifdef DBG_LOOKUP
+	std::cout<<"[yfs_client::lookup2()] : Buffer is\n\r"<<buf<<std::endl;
+#endif
+	removeSpace(targetName);
+	found = false;
+	targetPos = buf.find(targetName+'\r');
+
+
+	if(targetPos == std::string::npos)
+	{
+		printf("[yfs_client::lookup2()] : File %s not found.\n", name);
+		r = NOENT;
+		goto release;
+	}
+	else
+	{
+
+		printf("[yfs_client::lookup2()] : File %s found at pos %lu.\n", name, targetPos);
+		found = true;
+		ss.seekg(targetPos);
+		ss>>fileName>>nodeStr;
+		ino_out = n2i(nodeStr);
+		std::cout<<"fileName="<<fileName<<", nodeStr="<<nodeStr<<std::endl;
+		printf("[yfs_client::lookup2()] : File %s, node %llu.\n", name, ino_out);
+	}
+
+release:
+	//lc->release(parent + 10000);
+	return r;
+}
+
+int
+	yfs_client::readdir(inum dir, std::list<dirent> &list)
+{
+	int r = OK;
+	lc->acquire(dir);
+	std::string buf;
+	std::istringstream ss;
+	std::string fileName;
+	std::string nodeStr;
+	std::list<dirent>::iterator it;
+	int nodeNum = 0;
+	if(ec->get(dir, buf) != extent_protocol::OK)
+	{
+		r = IOERR;
+		printf("[yfs_client::readdir()] : node %llu not found!\n", dir);
+		goto release;
+	}
+	ss.str(buf);
+#ifdef DBG_READDIR
+	std::cout<<"[yfs_client::readdir()] : buf is"<<std::endl;
+	std::cout<<buf<<std::endl;
+#endif
+	while(!ss.eof())
+	{
+		fileName="";
+		nodeStr="";
+		ss>>fileName>>nodeStr;
+		if(fileName == "")
+		{
+			if(ss.eof())
+			{
+				break;
+			}
+			else
+			{
+				continue;
+			}
+		}
+		addSpace(fileName);
+		nodeNum = n2i(nodeStr);
+		struct dirent newDirEntry;
+		newDirEntry.inum = nodeNum;
+		newDirEntry.name = fileName;
+		list.push_back(newDirEntry);
+	}
+#ifdef DBG_READDIR
+	printf("[yfs_client::readdir()] : list info:\n");
+	for(it = list.begin() ; it != list.end() ; it++)
+	{
+		std::cout<<it->inum<<"\t"<<it->name<<std::endl;
+	}
+	printf("[yfs_client::readdir()] : list info End:\n");
+#endif
+release:
+lc->release(dir);
+	return r;
+}
+
+int
+	yfs_client::read(inum ino, size_t size, off_t off, std::string &data)
+{
+	int r = OK;
+    lc->acquire(ino);
+	std::string buf;
+	if(ec->get(ino, buf) != extent_protocol::OK)
+	{
+		printf("[yfs_client::read()] : node %llu not found!\n", ino);
+		r = IOERR;
+		goto release;
+	}
+	data = buf.substr(off, size);
+    //tprintf("[yfs_client::read()] : node %llu, size=%lu, off=%lu, data=|%s| \n", ino, size,off, data.c_str());
+	if(size >= 4)
+	{
+        printf("===");
+        for(int i = 0 ; i < 4 ; i++)
+        {
+            printf("0x%x", data[i]);
+        }
+        printf("===\n");
+	}
+release:
+lc->release(ino);
+	return r;
+}
+
+
+int
+	yfs_client::write(inum ino, size_t size, off_t off, const char *data,
+	size_t &bytes_written)
+{
+    lc->acquire(ino);
+    //Bytes written UNUSED
+    //IF disk space is not enough, NOTHING IS DONE
+	int r = OK;
+	//tprintf("[yfs_client::write()] : node %llu, size=%lu, off=%lu, data=|%s| \n", ino, size,off, data);
+	if(size >= 4)
+	{
+        printf("===");
+        for(int i = 0 ; i < 4 ; i++)
+        {
+            printf("0x%x", data[i]);
+        }
+        printf("===\n");
+	}
+	std::string newData(data, size);
+	std::string buf;
+	off_t prevLen;
+	if(ec->get(ino, buf) != extent_protocol::OK)
+	{
+		printf("[yfs_client::write()] : node %llu not found!\n", ino);
+		r = IOERR;
+		goto release;
+	}
+#ifdef DBG_WRITE
+    std::cout<<"[yfs_client::write()] : bufLen is"<<std::endl;
+	std::cout<<buf.length()<<std::endl;
+#endif
+	prevLen = buf.length();
+	if(off > prevLen)
+	{
+		buf.resize(off+size, '\0');
+	}
+
+	buf.replace(off, size, newData);
+#ifdef DBG_WRITE
+    std::cout<<"[yfs_client::write()] : after, buflen is"<<std::endl;
+	std::cout<<buf.length()<<std::endl;
+#endif
+	//Write changes back to disk
+	ec->put(ino, buf);
+	/*
+	* your lab2 code goes here.
+	* note: write using ec->put().
+	* when off > length of original file, fill the holes with '\0'.
+	*/
+
+release:
+    lc->release(ino);
+	return r;
+}
+
+int yfs_client::unlink(inum parent,const char *name)
+{
+	int r = OK;
+	lc->acquire(parent);
+	std::string buf;
+	std::string targetName(name);
+	removeSpace(targetName);
+	std::string removeStr;
+	std::string nodeStr;
+	inum removeNode;
+	size_t nameStart = 0;
+	int nameEnd = 0;
+	int numStart = 0;
+	int numEnd = 0;
+	if(ec->get(parent, buf) != extent_protocol::OK)
+	{
+		r = IOERR;
+		goto release;
+	}
+#ifdef DBG_UNLINK
+	std::cout<<"[yfs_client::unlink()] : buf is"<<std::endl;
+	std::cout<<buf<<std::endl;
+	std::cout<<"[yfs_client::unlink()] : targetName is"<<std::endl;
+	std::cout<<targetName<<std::endl;
+#endif
+	targetName = targetName + '\r';
+	nameStart = buf.find(targetName);
+	if(nameStart == std::string::npos)
+	{
+		printf("[yfs_client::unlink()] : Filename %s not found in dir!\n", name);
+		r = NOENT;
+		goto release;
+	}
+	//Filename found at pos
+	nameEnd = buf.find('\r', nameStart);
+	removeStr = buf.substr(nameStart, nameEnd - nameStart);
+	//Look for inode number
+	numStart = nameEnd + 1;
+	numEnd = buf.find('\r', numStart+1);
+	nodeStr = buf.substr(numStart, numEnd - numStart);
+	removeNode = n2i(nodeStr);
+#ifdef DBG_UNLINK
+	std::cout<<"[yfs_client::unlink()] : removed node is"<<nodeStr<<std::endl;
+	printf("numEnd=%d, numStart=%d\n", numEnd, numStart);
+#endif
+	buf.replace(nameStart, numEnd - nameStart + 1, "");
+#ifdef DBG_UNLINK
+	std::cout<<"[yfs_client::unlink()] : after delete, buf is"<<std::endl;
+	std::cout<<buf<<std::endl;
+#endif
+	if(ec->remove(removeNode) != extent_protocol::OK)
+	{
+		printf("[yfs_client::unlink()] : node %llu not found!\n", removeNode);
+		r = IOERR;
+		goto release;
+	}
+	if(ec->put(parent, buf) != extent_protocol::OK)
+	{
+		r = IOERR;
+		goto release;
+	}
+
+release:
+    lc->release(parent);
+	return r;
+}
+
